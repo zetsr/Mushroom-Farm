@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include <objbase.h>
 #include <Unknwn.h> // For IUnknown
 #include <ShObjIdl.h> // For IObjectArray, IServiceProvider

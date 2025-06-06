@@ -9,12 +9,15 @@
 #include <chrono>
 #include <locale>
 #include <algorithm>
+#include <iostream> 
+#include <TlHelp32.h> 
+
+// IMPORTANT: Include YOUR VirtualDesktopApi.h here!
+#include "VirtualDesktopApi.h" 
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "comctl32.lib")
-
-#include "VirtualDesktopApi.h"
 
 // --- Global Variables ---
 HWND g_hWnd = nullptr;
@@ -25,17 +28,34 @@ bool g_bPaused = true;
 HANDLE g_hPauseEvent = nullptr;
 HANDLE g_hStopEvent = nullptr;
 std::thread g_logicThread;
+std::thread g_debuggerCheckThread;
 int g_clients = 0;
 int g_desktops = 0;
 int g_currentClient = 0;
 int g_currentDesktop = 0;
 RECT g_stateTextRect = { 0 };
-float g_guiPaddingX = 15.0f;
-float g_guiPaddingY = 10.0f;
-float g_stateInfoSpacing = 20.0f;
-std::random_device rd_desktop;
-std::mt19937 gen_desktop(rd_desktop());
+
+// --- 调整后的 GUI 尺寸参数 ---
+// 减小内边距，例如从 15.0f 减到 10.0f
+float g_guiPaddingX = 10.0f;
+// 减小内边距，例如从 10.0f 减到 7.0f
+float g_guiPaddingY = 7.0f;
+// 调整信息文本和状态文本之间的间距
+float g_stateInfoSpacing = 15.0f;
+// 调整字体大小，例如从 12.0f 减到 10.0f 或 11.0f
+const float GUI_FONT_SIZE = 10.0f; // 新增常量，方便统一修改字体大小
+
+std::random_device rd;
+std::mt19937 gen(rd());
 IVirtualDesktopManagerInternal* g_pVDManagerInternal = nullptr;
+
+std::wstring g_randomAppName = L"";
+
+// Unique name for the mutex (IMPORTANT: Replace with YOUR OWN generated GUID!)
+// You can use Visual Studio's "Tools" -> "Create GUID" to generate a new one.
+// The GUID should be unique to your application.
+const wchar_t* const g_szSingleInstanceMutexName = L"Global\\{A1B2C3D4-E5F6-7890-ABCD-EF0123456789}_MushroomFarmMutex";
+HANDLE g_hSingleInstanceMutex = nullptr;
 
 // Custom messages
 #define WM_UPDATE_GUI  (WM_USER + 1)
@@ -44,20 +64,24 @@ IVirtualDesktopManagerInternal* g_pVDManagerInternal = nullptr;
 
 // --- WindowInfo Structure ---
 struct WindowInfo {
-    HWND hwnd;
+    HWND hwnd = nullptr;
     std::wstring title;
-    RECT clientRectScreenCoords;
+    RECT clientRectScreenCoords = { 0, 0, 0, 0 };
 };
 
 // --- Forward Declarations ---
 LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK MenuWindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 void LogicThreadProc();
+void DebuggerCheckThreadProc();
 void PositionWindowAtTop(HWND hWnd);
 static float GetDpiScale(HWND hwnd);
 void DrawGUI(HDC hdc, RECT rect, float dpiScale);
 void DrawMenuGUI(HDC hdc, RECT rect, float dpiScale);
 void ShowCustomTrayMenu(HWND hWnd, POINT pt);
+std::wstring GenerateRandomFileName(int length);
+void SelfRenameExecutable();
+void SafeShutdown();
 
 // --- Window Enumeration Callback ---
 BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
@@ -66,7 +90,9 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
     GetWindowTextW(hwnd, windowTitle, TITLE_SIZE);
     std::wstring title(windowTitle);
 
-    if (title.find(L"Roblox") != std::wstring::npos) {
+    // Full word match for "Roblox"
+    // Check if the title contains "Roblox" AND its length is exactly 6 (for "Roblox")
+    if (title.find(L"Roblox") != std::wstring::npos && title.length() == std::wstring(L"Roblox").length()) {
         RECT clientRect;
         if (GetClientRect(hwnd, &clientRect)) {
             POINT topLeft = { clientRect.left, clientRect.top };
@@ -120,23 +146,8 @@ void SendKeyWithRandomDelay(WORD vk, int minMs = 50, int maxMs = 200, bool prefe
 
     SendInput(1, &inputDown, sizeof(INPUT));
     std::uniform_int_distribution<> dis(minMs, maxMs);
-    int delay = dis(gen_desktop);
+    int delay = dis(gen);
     std::this_thread::sleep_for(std::chrono::milliseconds(delay));
-    SendInput(1, &inputUp, sizeof(INPUT));
-}
-
-// --- Send Right Click With Random Delay ---
-void SendRightClickWithRandomDelay(int minMs = 50, int maxMs = 200) {
-    INPUT inputDown = {};
-    inputDown.type = INPUT_MOUSE;
-    inputDown.mi.dwFlags = MOUSEEVENTF_RIGHTDOWN;
-    SendInput(1, &inputDown, sizeof(INPUT));
-    std::uniform_int_distribution<> dis(minMs, maxMs);
-    int delay = dis(gen_desktop);
-    std::this_thread::sleep_for(std::chrono::milliseconds(delay));
-    INPUT inputUp = {};
-    inputUp.type = INPUT_MOUSE;
-    inputUp.mi.dwFlags = MOUSEEVENTF_RIGHTUP;
     SendInput(1, &inputUp, sizeof(INPUT));
 }
 
@@ -172,21 +183,19 @@ bool InitializeVirtualDesktopManager() {
     if (FAILED(hr)) return false;
 
     IServiceProvider* pServiceProvider = nullptr;
+    // Use CLSID_ImmersiveShell from your VirtualDesktopApi.h
     hr = CoCreateInstance(CLSID_ImmersiveShell, NULL, CLSCTX_LOCAL_SERVER, IID_IServiceProvider, (void**)&pServiceProvider);
     if (FAILED(hr)) {
         CoUninitialize();
         return false;
     }
 
+    // Use CLSID_VirtualDesktopManager_Service and IID_IVirtualDesktopManagerInternal from your VirtualDesktopApi.h
     hr = pServiceProvider->QueryService(CLSID_VirtualDesktopManager_Service, IID_IVirtualDesktopManagerInternal, (void**)&g_pVDManagerInternal);
     if (FAILED(hr)) {
-        const GUID IID_IVirtualDesktopManagerInternal_Old = { 0xF31574D6, 0xB682, 0x4CDC, {0xBD, 0x56, 0x18, 0x27, 0x86, 0x0A, 0xBE, 0xC6} };
-        hr = pServiceProvider->QueryService(CLSID_VirtualDesktopManager_Service, IID_IVirtualDesktopManagerInternal_Old, (void**)&g_pVDManagerInternal);
-        if (FAILED(hr)) {
-            SafeRelease(&pServiceProvider);
-            CoUninitialize();
-            return false;
-        }
+        SafeRelease(&pServiceProvider);
+        CoUninitialize();
+        return false;
     }
     SafeRelease(&pServiceProvider);
     if (!g_pVDManagerInternal) {
@@ -211,31 +220,128 @@ bool SwitchToDesktopByIndex(UINT index) {
     if (FAILED(hr) || !pDesktopsArray) return false;
 
     IVirtualDesktop* pDesktopToSwitch = nullptr;
+    // Use __uuidof(IVirtualDesktop) to get the correct IID for IVirtualDesktop
     hr = pDesktopsArray->GetAt(index, __uuidof(IVirtualDesktop), (void**)&pDesktopToSwitch);
     if (FAILED(hr) || !pDesktopToSwitch) {
         SafeRelease(&pDesktopsArray);
         return false;
     }
 
+    // Use SwitchDesktop from your VirtualDesktopApi.h
     hr = g_pVDManagerInternal->SwitchDesktop(pDesktopToSwitch);
     SafeRelease(&pDesktopToSwitch);
     SafeRelease(&pDesktopsArray);
     return SUCCEEDED(hr);
 }
 
+// --- Generate Random File Name ---
+std::wstring GenerateRandomFileName(int length) {
+    const std::wstring chars = L"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    std::uniform_int_distribution<> char_dist(0, static_cast<int>(chars.length() - 1));
+    std::wstring result;
+    for (int i = 0; i < length; ++i) {
+        result += chars[char_dist(gen)];
+    }
+    return result;
+}
+
+// --- Self-Rename Executable ---
+void SelfRenameExecutable() {
+    wchar_t szPath[MAX_PATH];
+    GetModuleFileNameW(NULL, szPath, MAX_PATH);
+    std::wstring currentPath = szPath;
+
+    size_t lastSlash = currentPath.find_last_of(L"\\");
+    std::wstring folderPath = currentPath.substr(0, lastSlash + 1);
+
+    std::uniform_int_distribution<> len_dist(3, 16);
+    g_randomAppName = GenerateRandomFileName(len_dist(gen));
+    std::wstring newName = g_randomAppName + L".exe";
+    std::wstring newPath = folderPath + newName;
+
+    if (!MoveFileExW(currentPath.c_str(), newPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        size_t lastDot = currentPath.find_last_of(L".");
+        if (lastDot != std::wstring::npos) {
+            g_randomAppName = currentPath.substr(lastSlash + 1, lastDot - (lastSlash + 1));
+        }
+        else {
+            g_randomAppName = currentPath.substr(lastSlash + 1);
+        }
+    }
+}
+
+// --- Safe Shutdown ---
+void SafeShutdown() {
+    if (g_hStopEvent != nullptr) {
+        SetEvent(g_hStopEvent);
+    }
+
+    if (g_hPauseEvent != nullptr) {
+        CloseHandle(g_hPauseEvent);
+        g_hPauseEvent = nullptr;
+    }
+    if (g_hStopEvent != nullptr) {
+        CloseHandle(g_hStopEvent);
+        g_hStopEvent = nullptr;
+    }
+
+    g_hSingleInstanceMutex = nullptr;
+
+    Shell_NotifyIcon(NIM_DELETE, &g_nid);
+
+    TerminateProcess(GetCurrentProcess(), 0);
+}
+
+// --- Debugger Check Thread ---
+void DebuggerCheckThreadProc() {
+    while (WaitForSingleObject(g_hStopEvent, 0) != WAIT_OBJECT_0) {
+        if (IsDebuggerPresent()) {
+            SafeShutdown();
+        }
+
+        BOOL bRemoteDebuggerPresent = FALSE;
+        if (CheckRemoteDebuggerPresent(GetCurrentProcess(), &bRemoteDebuggerPresent) && bRemoteDebuggerPresent) {
+            SafeShutdown();
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+
 // --- WinMain ---
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nShowCmd) {
+
+    // --- Single Instance Check ---
+    g_hSingleInstanceMutex = CreateMutex(
+        NULL,
+        TRUE,
+        g_szSingleInstanceMutexName
+    );
+
+    if (g_hSingleInstanceMutex == NULL) {
+        MessageBoxW(NULL, L"无法创建互斥锁，程序无法启动。", L"Mushroom Farm - 错误", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+
+    DWORD dwLastError = GetLastError();
+    if (dwLastError == ERROR_ALREADY_EXISTS) {
+        CloseHandle(g_hSingleInstanceMutex);
+        g_hSingleInstanceMutex = nullptr;
+        MessageBoxW(NULL, L"Mushroom Farm 已经在运行中。请勿重复运行。", L"Mushroom Farm - 警告", MB_OK | MB_ICONWARNING);
+        return 1;
+    }
+
+    SelfRenameExecutable();
+
     g_hInstance = hInstance;
 
-    // DPI Awareness
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-    // Initialize GDI+
     Gdiplus::GdiplusStartupInput gdipInput;
     ULONG_PTR gdipToken;
     Gdiplus::GdiplusStartup(&gdipToken, &gdipInput, nullptr);
 
-    // Register main window class
     WNDCLASSEX wc = { sizeof(wc) };
     wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = WindowProc;
@@ -244,7 +350,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     wc.lpszClassName = L"RobloxGUI";
     RegisterClassEx(&wc);
 
-    // Register menu window class
     WNDCLASSEX wcMenu = { sizeof(wcMenu) };
     wcMenu.style = CS_HREDRAW | CS_VREDRAW;
     wcMenu.lpfnWndProc = MenuWindowProc;
@@ -253,9 +358,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     wcMenu.lpszClassName = L"RobloxTrayMenu";
     RegisterClassEx(&wcMenu);
 
-    // Calculate initial window size
     float dpiScale = GetDpiScale(GetDesktopWindow());
-    Gdiplus::Font tempFont(L"Segoe UI", 12.0f * dpiScale);
+    // 使用 GUI_FONT_SIZE
+    Gdiplus::Font tempFont(L"Segoe UI", GUI_FONT_SIZE * dpiScale);
     Gdiplus::Graphics tempGraphics(GetDC(NULL));
     Gdiplus::RectF layoutRect(0, 0, 2000, 100);
     Gdiplus::RectF boundsState, boundsInfo;
@@ -265,11 +370,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     std::wstring maxInfoString = L"客户端: 99 | 桌面: 99 | 当前客户端: 99 | 当前桌面: 99";
     tempGraphics.MeasureString(maxInfoString.c_str(), -1, &tempFont, layoutRect, &boundsInfo);
 
-    int desiredWidth = static_cast<int>(std::ceil((g_guiPaddingX * 2) + boundsState.Width + g_stateInfoSpacing + boundsInfo.Width));
-    int desiredHeight = static_cast<int>(std::ceil(max(boundsState.Height, boundsInfo.Height) + (g_guiPaddingY * 2)));
-    if (desiredHeight < 50) desiredHeight = 50;
+    // 重新计算窗口大小，使用新的 padding 和 spacing
+    int desiredWidth = static_cast<int>(std::ceil((g_guiPaddingX * 2 * dpiScale) + boundsState.Width + (g_stateInfoSpacing * dpiScale) + boundsInfo.Width));
+    int desiredHeight = static_cast<int>(std::ceil(max(boundsState.Height, boundsInfo.Height) + (g_guiPaddingY * 2 * dpiScale)));
+    if (desiredHeight < 50) desiredHeight = 50; // 确保最小高度
 
-    // Create main window
     g_hWnd = CreateWindowEx(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
         wc.lpszClassName, L"",
@@ -278,41 +383,68 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         nullptr, nullptr, hInstance, nullptr);
     if (!g_hWnd) {
         Gdiplus::GdiplusShutdown(gdipToken);
+        if (g_hSingleInstanceMutex != nullptr) {
+            CloseHandle(g_hSingleInstanceMutex);
+            g_hSingleInstanceMutex = nullptr;
+        }
         return 1;
     }
 
-    // Set window attributes
     SetWindowLong(g_hWnd, GWL_STYLE, WS_POPUP);
     SetLayeredWindowAttributes(g_hWnd, RGB(0, 0, 0), 255, LWA_ALPHA | LWA_COLORKEY);
-    BOOL dark = TRUE;
+    BOOL dark = static_cast<BOOL>(1);
     DwmSetWindowAttribute(g_hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
 
     PositionWindowAtTop(g_hWnd);
     ShowWindow(g_hWnd, SW_SHOW);
     UpdateWindow(g_hWnd);
 
-    // System tray icon
     g_nid = { sizeof(NOTIFYICONDATA), g_hWnd, 1, NIF_ICON | NIF_MESSAGE | NIF_TIP, WM_TRAYICON, LoadIcon(nullptr, IDI_APPLICATION) };
-    wcscpy_s(g_nid.szTip, L"Roblox GUI");
+
+    if (!g_randomAppName.empty()) {
+        wcsncpy_s(g_nid.szTip, g_randomAppName.c_str(), _TRUNCATE);
+    }
+    else {
+        wcscpy_s(g_nid.szTip, L"Mushroom Farm");
+    }
     Shell_NotifyIcon(NIM_ADD, &g_nid);
 
-    // Events and thread
     g_hPauseEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
     g_hStopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-    g_logicThread = std::thread(LogicThreadProc);
 
-    // Message loop
+    g_logicThread = std::thread(LogicThreadProc);
+    g_debuggerCheckThread = std::thread(DebuggerCheckThreadProc);
+
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
 
-    // Cleanup
-    SetEvent(g_hStopEvent);
-    g_logicThread.join();
-    CloseHandle(g_hPauseEvent);
-    CloseHandle(g_hStopEvent);
+    if (g_hStopEvent != nullptr) {
+        SetEvent(g_hStopEvent);
+    }
+    if (g_logicThread.joinable()) {
+        g_logicThread.join();
+    }
+    if (g_debuggerCheckThread.joinable()) {
+        g_debuggerCheckThread.join();
+    }
+
+    if (g_hPauseEvent != nullptr) {
+        CloseHandle(g_hPauseEvent);
+        g_hPauseEvent = nullptr;
+    }
+    if (g_hStopEvent != nullptr) {
+        CloseHandle(g_hStopEvent);
+        g_hStopEvent = nullptr;
+    }
+
+    if (g_hSingleInstanceMutex != nullptr) {
+        CloseHandle(g_hSingleInstanceMutex);
+        g_hSingleInstanceMutex = nullptr;
+    }
+
     Shell_NotifyIcon(NIM_DELETE, &g_nid);
     Gdiplus::GdiplusShutdown(gdipToken);
     return 0;
@@ -337,12 +469,11 @@ void DrawGUI(HDC hdc, RECT rect, float dpiScale) {
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
 
-    // Clear background to transparent
     Gdiplus::SolidBrush clearBrush(Gdiplus::Color(0, 0, 0, 0));
     g.FillRectangle(&clearBrush, 0, 0, rect.right, rect.bottom);
 
-    // Calculate dimensions
-    Gdiplus::Font font(L"Segoe UI", 12.0f * dpiScale);
+    // 使用 GUI_FONT_SIZE
+    Gdiplus::Font font(L"Segoe UI", GUI_FONT_SIZE * dpiScale);
     Gdiplus::RectF layoutRect(0, 0, 2000, 100);
     Gdiplus::RectF boundsState, boundsInfo;
     std::wstring state = g_bPaused ? L"暂停中" : L"运行中";
@@ -354,41 +485,34 @@ void DrawGUI(HDC hdc, RECT rect, float dpiScale) {
     g.MeasureString(state.c_str(), -1, &font, layoutRect, &boundsState);
     g.MeasureString(info.c_str(), -1, &font, layoutRect, &boundsInfo);
 
-    float totalWidth = g_guiPaddingX * dpiScale + boundsState.Width + g_stateInfoSpacing * dpiScale + boundsInfo.Width + g_guiPaddingX * dpiScale;
+    // 重新计算 totalWidth 和 totalHeight，使用新的 padding 和 spacing
+    float totalWidth = (g_guiPaddingX * dpiScale) + boundsState.Width + (g_stateInfoSpacing * dpiScale) + boundsInfo.Width + (g_guiPaddingX * dpiScale);
     float maxHeight = max(boundsState.Height, boundsInfo.Height);
-    float totalHeight = maxHeight + 2 * g_guiPaddingY * dpiScale;
+    float totalHeight = maxHeight + (2 * g_guiPaddingY * dpiScale);
 
     // Resize window
     SetWindowPos(g_hWnd, NULL, 0, 0, static_cast<int>(totalWidth), static_cast<int>(totalHeight), SWP_NOMOVE | SWP_NOZORDER);
     PositionWindowAtTop(g_hWnd);
 
-    // Draw background (top square corners, bottom rounded corners)
     Gdiplus::SolidBrush backgroundBrush(Gdiplus::Color(255, 30, 30, 30));
     Gdiplus::GraphicsPath path;
-    float cornerRadius = 10.0f * dpiScale; // Fixed corner radius for bottom corners
+    float cornerRadius = 10.0f * dpiScale;
     Gdiplus::RectF drawRect(0, 0, totalWidth, totalHeight);
 
-    // Start at top-left (square corner)
     path.AddLine(drawRect.X, drawRect.Y + cornerRadius, drawRect.X, drawRect.Y);
     path.AddLine(drawRect.X, drawRect.Y, drawRect.Width, drawRect.Y);
-    // Top-right (square corner)
     path.AddLine(drawRect.Width, drawRect.Y, drawRect.Width, drawRect.Y + cornerRadius);
-    // Bottom-right (rounded corner)
     path.AddArc(drawRect.Width - 2 * cornerRadius, drawRect.Height - 2 * cornerRadius, 2 * cornerRadius, 2 * cornerRadius, 0, 90);
-    // Bottom-left (rounded corner)
     path.AddArc(drawRect.X, drawRect.Height - 2 * cornerRadius, 2 * cornerRadius, 2 * cornerRadius, 90, 90);
-    // Close path
     path.CloseFigure();
 
     g.FillPath(&backgroundBrush, &path);
 
-    // Draw text
     Gdiplus::SolidBrush txtBrush(Gdiplus::Color(255, 255, 255, 255));
     float textY = g_guiPaddingY * dpiScale;
     g.DrawString(state.c_str(), -1, &font, Gdiplus::PointF(g_guiPaddingX * dpiScale, textY), &txtBrush);
     g.DrawString(info.c_str(), -1, &font, Gdiplus::PointF(g_guiPaddingX * dpiScale + boundsState.Width + g_stateInfoSpacing * dpiScale, textY), &txtBrush);
 
-    // Update clickable area
     g_stateTextRect = {
         static_cast<LONG>(g_guiPaddingX * dpiScale),
         static_cast<LONG>(textY),
@@ -412,12 +536,11 @@ void DrawMenuGUI(HDC hdc, RECT rect, float dpiScale) {
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
 
-    // Clear background to transparent
     Gdiplus::SolidBrush clearBrush(Gdiplus::Color(0, 0, 0, 0));
     g.FillRectangle(&clearBrush, 0, 0, rect.right, rect.bottom);
 
-    // Calculate dimensions
-    Gdiplus::Font font(L"Segoe UI", 12.0f * dpiScale);
+    // 使用 GUI_FONT_SIZE
+    Gdiplus::Font font(L"Segoe UI", GUI_FONT_SIZE * dpiScale);
     Gdiplus::RectF layoutRect(0, 0, 2000, 100);
     Gdiplus::RectF boundsExit;
     std::wstring exitText = L"Exit";
@@ -427,7 +550,6 @@ void DrawMenuGUI(HDC hdc, RECT rect, float dpiScale) {
     float totalWidth = boundsExit.Width + 2 * padding;
     float totalHeight = boundsExit.Height + 2 * padding;
 
-    // Draw background (four rounded corners)
     Gdiplus::SolidBrush backgroundBrush(Gdiplus::Color(255, 30, 30, 30));
     Gdiplus::GraphicsPath path;
     float radius = totalHeight / 2.0f;
@@ -441,7 +563,6 @@ void DrawMenuGUI(HDC hdc, RECT rect, float dpiScale) {
 
     g.FillPath(&backgroundBrush, &path);
 
-    // Draw text
     Gdiplus::SolidBrush txtBrush(Gdiplus::Color(255, 255, 255, 255));
     g.DrawString(exitText.c_str(), -1, &font, Gdiplus::PointF(padding, padding), &txtBrush);
 
@@ -459,7 +580,8 @@ void ShowCustomTrayMenu(HWND hWnd, POINT pt) {
     }
 
     float dpiScale = GetDpiScale(hWnd);
-    Gdiplus::Font font(L"Segoe UI", 12.0f * dpiScale);
+    // 使用 GUI_FONT_SIZE
+    Gdiplus::Font font(L"Segoe UI", GUI_FONT_SIZE * dpiScale);
     Gdiplus::Graphics tempGraphics(GetDC(NULL));
     Gdiplus::RectF layoutRect(0, 0, 2000, 100);
     Gdiplus::RectF boundsExit;
@@ -479,13 +601,12 @@ void ShowCustomTrayMenu(HWND hWnd, POINT pt) {
     if (g_hMenuWnd) {
         SetWindowLong(g_hMenuWnd, GWL_STYLE, WS_POPUP);
         SetLayeredWindowAttributes(g_hMenuWnd, RGB(0, 0, 0), 255, LWA_ALPHA | LWA_COLORKEY);
-        BOOL dark = TRUE;
+        BOOL dark = static_cast<BOOL>(1);
         DwmSetWindowAttribute(g_hMenuWnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
 
         ShowWindow(g_hMenuWnd, SW_SHOW);
         UpdateWindow(g_hMenuWnd);
 
-        // Capture mouse to handle clicks outside the menu
         SetCapture(g_hMenuWnd);
     }
 }
@@ -496,19 +617,42 @@ void LogicThreadProc() {
     std::locale::global(std::locale(""));
 
     if (!InitializeVirtualDesktopManager()) {
-        // Handle error
+        // Handle error, maybe log or display a message
     }
 
-    std::uniform_real_distribution<> delayDist(5.0, 10.0);
+    std::uniform_int_distribution<> keySendDelaySec(50, 70);
     HANDLE h[] = { g_hPauseEvent, g_hStopEvent };
     const DWORD CHECK_INTERVAL_MS = 100;
 
     while (true) {
-        DWORD wait_result = WaitForMultipleObjects(2, h, FALSE, CHECK_INTERVAL_MS);
-        if (wait_result == WAIT_OBJECT_0 + 1) break;
+        HANDLE valid_handles[2] = { nullptr, nullptr };
+        int num_valid_handles = 0;
+        if (g_hPauseEvent != nullptr) {
+            valid_handles[num_valid_handles++] = g_hPauseEvent;
+        }
+        if (g_hStopEvent != nullptr) {
+            valid_handles[num_valid_handles++] = g_hStopEvent;
+        }
+
+        DWORD wait_result = WAIT_TIMEOUT;
+        if (num_valid_handles > 0) {
+            wait_result = WaitForMultipleObjects(num_valid_handles, valid_handles, FALSE, CHECK_INTERVAL_MS);
+        }
+        else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(CHECK_INTERVAL_MS));
+        }
+
+        if (g_hStopEvent != nullptr && wait_result == (WAIT_OBJECT_0 + (num_valid_handles - 1))) break;
+
         if (g_bPaused) {
-            while (WaitForSingleObject(g_hPauseEvent, CHECK_INTERVAL_MS) != WAIT_OBJECT_0) {
-                if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) goto end_logic_thread;
+            while (true) {
+                if (g_hPauseEvent != nullptr && WaitForSingleObject(g_hPauseEvent, CHECK_INTERVAL_MS) == WAIT_OBJECT_0) {
+                    break;
+                }
+                if (g_hStopEvent != nullptr && WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) {
+                    goto end_logic_thread;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(CHECK_INTERVAL_MS));
             }
         }
 
@@ -527,76 +671,118 @@ void LogicThreadProc() {
         }
 
         for (UINT i = 0; i < desktopCount; ++i) {
-            if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) goto end_logic_thread;
+            if (g_hStopEvent != nullptr && WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) goto end_logic_thread;
             if (g_bPaused) {
-                while (WaitForSingleObject(g_hPauseEvent, CHECK_INTERVAL_MS) != WAIT_OBJECT_0) {
-                    if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) goto end_logic_thread;
+                while (true) {
+                    if (g_hPauseEvent != nullptr && WaitForSingleObject(g_hPauseEvent, CHECK_INTERVAL_MS) == WAIT_OBJECT_0) {
+                        break;
+                    }
+                    if (g_hStopEvent != nullptr && WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) {
+                        goto end_logic_thread;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(CHECK_INTERVAL_MS));
                 }
             }
 
             if (g_pVDManagerInternal) {
-                if (!SwitchToDesktopByIndex(i)) continue;
+                if (!SwitchToDesktopByIndex(i)) {
+                    continue;
+                }
                 auto start_sleep_vd = std::chrono::high_resolution_clock::now();
                 while (std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_sleep_vd).count() < 1.0) {
-                    if (WaitForSingleObject(g_hStopEvent, CHECK_INTERVAL_MS) == WAIT_OBJECT_0) goto end_logic_thread;
+                    if (g_hStopEvent != nullptr && WaitForSingleObject(g_hStopEvent, CHECK_INTERVAL_MS) == WAIT_OBJECT_0) goto end_logic_thread;
                     if (g_bPaused) {
-                        while (WaitForSingleObject(g_hPauseEvent, CHECK_INTERVAL_MS) != WAIT_OBJECT_0) {
-                            if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) goto end_logic_thread;
+                        while (true) {
+                            if (g_hPauseEvent != nullptr && WaitForSingleObject(g_hPauseEvent, CHECK_INTERVAL_MS) == WAIT_OBJECT_0) {
+                                break;
+                            }
+                            if (g_hStopEvent != nullptr && WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) {
+                                goto end_logic_thread;
+                            }
+                            std::this_thread::sleep_for(std::chrono::milliseconds(CHECK_INTERVAL_MS));
                         }
                     }
                 }
             }
-            else if (i > 0) break;
+            else if (i > 0) {
+                break;
+            }
 
             std::vector<WindowInfo> windowsOnThisDesktop;
             EnumWindows(EnumWindowsProc, reinterpret_cast<LPARAM>(&windowsOnThisDesktop));
 
             PostMessage(g_hWnd, WM_UPDATE_GUI,
-                (windowsOnThisDesktop.size() & 0xFFFF) | ((desktopCount & 0xFFFF) << 16),
-                (0 & 0xFFFF) | ((i + 1 & 0xFFFF) << 16));
+                (static_cast<UINT>(windowsOnThisDesktop.size()) & 0xFFFF) | ((static_cast<UINT>(desktopCount) & 0xFFFF) << 16),
+                (0 & 0xFFFF) | ((static_cast<UINT>(i + 1) & 0xFFFF) << 16));
 
             if (!windowsOnThisDesktop.empty()) {
                 int currentClientIndex = 0;
                 for (const auto& win : windowsOnThisDesktop) {
-                    if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) goto end_logic_thread;
+                    if (g_hStopEvent != nullptr && WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) goto end_logic_thread;
                     if (g_bPaused) {
-                        while (WaitForSingleObject(g_hPauseEvent, CHECK_INTERVAL_MS) != WAIT_OBJECT_0) {
-                            if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) goto end_logic_thread;
+                        while (true) {
+                            if (g_hPauseEvent != nullptr && WaitForSingleObject(g_hPauseEvent, CHECK_INTERVAL_MS) == WAIT_OBJECT_0) {
+                                break;
+                            }
+                            if (g_hStopEvent != nullptr && WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) {
+                                goto end_logic_thread;
+                            }
+                            std::this_thread::sleep_for(std::chrono::milliseconds(CHECK_INTERVAL_MS));
                         }
                     }
 
                     PostMessage(g_hWnd, WM_UPDATE_GUI,
-                        (windowsOnThisDesktop.size() & 0xFFFF) | ((desktopCount & 0xFFFF) << 16),
-                        ((++currentClientIndex) & 0xFFFF) | ((i + 1 & 0xFFFF) << 16));
+                        (static_cast<UINT>(windowsOnThisDesktop.size()) & 0xFFFF) | ((static_cast<UINT>(desktopCount) & 0xFFFF) << 16),
+                        ((static_cast<UINT>(++currentClientIndex)) & 0xFFFF) | ((static_cast<UINT>(i + 1) & 0xFFFF) << 16));
 
                     if (ForceForegroundWindow(win.hwnd)) {
                         auto start_sleep_activate = std::chrono::high_resolution_clock::now();
                         while (std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_sleep_activate).count() < 0.3) {
-                            if (WaitForSingleObject(g_hStopEvent, CHECK_INTERVAL_MS) == WAIT_OBJECT_0) goto end_logic_thread;
+                            if (g_hStopEvent != nullptr && WaitForSingleObject(g_hStopEvent, CHECK_INTERVAL_MS) == WAIT_OBJECT_0) goto end_logic_thread;
                             if (g_bPaused) {
-                                while (WaitForSingleObject(g_hPauseEvent, CHECK_INTERVAL_MS) != WAIT_OBJECT_0) {
-                                    if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) goto end_logic_thread;
+                                while (true) {
+                                    if (g_hPauseEvent != nullptr && WaitForSingleObject(g_hPauseEvent, CHECK_INTERVAL_MS) == WAIT_OBJECT_0) {
+                                        break;
+                                    }
+                                    if (g_hStopEvent != nullptr && WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) {
+                                        goto end_logic_thread;
+                                    }
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(CHECK_INTERVAL_MS));
                                 }
                             }
                         }
+
                         SendKeyWithRandomDelay(0x45, 100, 300, true);
-                        auto start_sleep_key = std::chrono::high_resolution_clock::now();
-                        while (std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_sleep_key).count() < 0.1) {
-                            if (WaitForSingleObject(g_hStopEvent, CHECK_INTERVAL_MS) == WAIT_OBJECT_0) goto end_logic_thread;
+                        auto start_sleep_key_e = std::chrono::high_resolution_clock::now();
+                        while (std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_sleep_key_e).count() < 0.1) {
+                            if (g_hStopEvent != nullptr && WaitForSingleObject(g_hStopEvent, CHECK_INTERVAL_MS) == WAIT_OBJECT_0) goto end_logic_thread;
                             if (g_bPaused) {
-                                while (WaitForSingleObject(g_hPauseEvent, CHECK_INTERVAL_MS) != WAIT_OBJECT_0) {
-                                    if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) goto end_logic_thread;
+                                while (true) {
+                                    if (g_hPauseEvent != nullptr && WaitForSingleObject(g_hPauseEvent, CHECK_INTERVAL_MS) == WAIT_OBJECT_0) {
+                                        break;
+                                    }
+                                    if (g_hStopEvent != nullptr && WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) {
+                                        goto end_logic_thread;
+                                    }
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(CHECK_INTERVAL_MS));
                                 }
                             }
                         }
-                        SendRightClickWithRandomDelay(100, 300);
+
+                        SendKeyWithRandomDelay(0x48, 100, 300, true);
                     }
                     auto start_sleep_next_win = std::chrono::high_resolution_clock::now();
                     while (std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_sleep_next_win).count() < 0.5) {
-                        if (WaitForSingleObject(g_hStopEvent, CHECK_INTERVAL_MS) == WAIT_OBJECT_0) goto end_logic_thread;
+                        if (g_hStopEvent != nullptr && WaitForSingleObject(g_hStopEvent, CHECK_INTERVAL_MS) == WAIT_OBJECT_0) goto end_logic_thread;
                         if (g_bPaused) {
-                            while (WaitForSingleObject(g_hPauseEvent, CHECK_INTERVAL_MS) != WAIT_OBJECT_0) {
-                                if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) goto end_logic_thread;
+                            while (true) {
+                                if (g_hPauseEvent != nullptr && WaitForSingleObject(g_hPauseEvent, CHECK_INTERVAL_MS) == WAIT_OBJECT_0) {
+                                    break;
+                                }
+                                if (g_hStopEvent != nullptr && WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) {
+                                    goto end_logic_thread;
+                                }
+                                std::this_thread::sleep_for(std::chrono::milliseconds(CHECK_INTERVAL_MS));
                             }
                         }
                     }
@@ -606,16 +792,22 @@ void LogicThreadProc() {
         }
 
         PostMessage(g_hWnd, WM_UPDATE_GUI,
-            (0 & 0xFFFF) | ((desktopCount & 0xFFFF) << 16),
+            (0 & 0xFFFF) | ((static_cast<UINT>(desktopCount) & 0xFFFF) << 16),
             (0 & 0xFFFF) | ((0 & 0xFFFF) << 16));
 
-        double roundDelaySeconds = delayDist(gen_desktop);
+        double roundDelaySeconds = keySendDelaySec(gen);
         auto start_sleep = std::chrono::high_resolution_clock::now();
         while (std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_sleep).count() < roundDelaySeconds) {
-            if (WaitForSingleObject(g_hStopEvent, CHECK_INTERVAL_MS) == WAIT_OBJECT_0) goto end_logic_thread;
+            if (g_hStopEvent != nullptr && WaitForSingleObject(g_hStopEvent, CHECK_INTERVAL_MS) == WAIT_OBJECT_0) goto end_logic_thread;
             if (g_bPaused) {
-                while (WaitForSingleObject(g_hPauseEvent, CHECK_INTERVAL_MS) != WAIT_OBJECT_0) {
-                    if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) goto end_logic_thread;
+                while (true) {
+                    if (g_hPauseEvent != nullptr && WaitForSingleObject(g_hPauseEvent, CHECK_INTERVAL_MS) == WAIT_OBJECT_0) {
+                        break;
+                    }
+                    if (g_hStopEvent != nullptr && WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) {
+                        goto end_logic_thread;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(CHECK_INTERVAL_MS));
                 }
             }
         }
@@ -633,21 +825,18 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         HDC hdc = GetDC(hWnd);
         Gdiplus::Graphics g(hdc);
         g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
-        Gdiplus::Font font(L"Segoe UI", 12.0f * dpiScale);
+        // 使用 GUI_FONT_SIZE
+        Gdiplus::Font font(L"Segoe UI", GUI_FONT_SIZE * dpiScale);
         Gdiplus::RectF layoutRect(0, 0, 2000, 100);
         Gdiplus::RectF boundsState;
         g.MeasureString(L"暂停中", -1, &font, layoutRect, &boundsState);
 
-        RECT clientRect;
-        GetClientRect(hWnd, &clientRect);
-        float textHeight = boundsState.Height;
-        g_guiPaddingY = (clientRect.bottom - clientRect.top - textHeight) / 2.0f;
-
+        // g_stateTextRect 应该直接使用全局的 padding 值进行计算
         g_stateTextRect = {
             static_cast<LONG>(g_guiPaddingX * dpiScale),
-            static_cast<LONG>(g_guiPaddingY),
+            static_cast<LONG>(g_guiPaddingY * dpiScale),
             static_cast<LONG>(g_guiPaddingX * dpiScale + boundsState.Width),
-            static_cast<LONG>(g_guiPaddingY + boundsState.Height)
+            static_cast<LONG>(g_guiPaddingY * dpiScale + boundsState.Height)
         };
         ReleaseDC(hWnd, hdc);
         break;
@@ -666,10 +855,10 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             y >= g_stateTextRect.top && y <= g_stateTextRect.bottom) {
             g_bPaused = !g_bPaused;
             if (g_bPaused) {
-                ResetEvent(g_hPauseEvent);
+                if (g_hPauseEvent != nullptr) ResetEvent(g_hPauseEvent);
             }
             else {
-                SetEvent(g_hPauseEvent);
+                if (g_hPauseEvent != nullptr) SetEvent(g_hPauseEvent);
             }
             InvalidateRect(hWnd, nullptr, FALSE);
         }
@@ -700,8 +889,7 @@ LRESULT CALLBACK WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             DestroyWindow(g_hMenuWnd);
             g_hMenuWnd = nullptr;
         }
-        SetEvent(g_hStopEvent);
-        PostQuitMessage(0);
+        SafeShutdown();
         break;
     default:
         return DefWindowProc(hWnd, uMsg, wParam, lParam);
@@ -727,9 +915,6 @@ LRESULT CALLBACK MenuWindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
         RECT rc; GetClientRect(hWnd, &rc);
         if (x >= 0 && x <= rc.right && y >= 0 && y <= rc.bottom) {
             PostMessage(GetParent(hWnd), WM_CLOSE, 0, 0);
-            DestroyWindow(hWnd);
-            g_hMenuWnd = nullptr;
-            ReleaseCapture();
         }
         break;
     }
